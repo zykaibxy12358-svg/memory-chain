@@ -93,6 +93,7 @@
         manualAliases: [],          // [{alias, name}]
         lexicon: null,              // 持久化的世界书词表 { names:[], aliases:[[alias,name]] }
         worldDropped: 0,
+        lexiconSource: '',
         maxHits: 1,
         turnsSinceChapter: 0,
         cache: { key: '', block: '' },
@@ -201,7 +202,7 @@
     }
 
     /** 从世界书 JSON（{entries:{...}}）建实体表：comment = 实体名，key[] = 别名 */
-    function buildFromWorldBook(json) {
+    function buildFromWorldBook(json, source) {
         const entries = json && json.entries ? json.entries : null;
         if (!entries) throw new Error('不是世界书 JSON（缺少 entries）');
         const list = Array.isArray(entries) ? entries : Object.values(entries);
@@ -233,7 +234,9 @@
         S.worldDropped = dropped + stopped;
         S.manualAliases.forEach((m) => addAlias(m.alias, m.name, true));
         rebuildAutomaton();
-        saveLexicon();
+        saveLexicon(source);
+        syncStats();
+        renderLexiconStatus();
         log('词表构建完成：实体', S.entities.size, '别名', S.aliasMap.size, '丢弃通用词', dropped, '停用词/过短', stopped);
         return { entities: S.entities.size, aliases: S.aliasMap.size, dropped: dropped, stopped: stopped };
     }
@@ -259,12 +262,16 @@
     }
 
     /** 词表（世界书实体 + 手写别名）持久化：否则每次启动都要重新导入世界书 */
-    function saveLexicon() {
+    function saveLexicon(source) {
         const names = [];
         S.entities.forEach((e) => { if (e.world || e.aliases.length) names.push(e.name); });
         const aliases = [];
         S.aliasMap.forEach((name, alias) => aliases.push([alias, name]));
-        persistKV('lexicon', { v: 1, names: names, aliases: aliases, dropped: S.worldDropped });
+        if (source) S.lexiconSource = source;
+        persistKV('lexicon', {
+            v: 1, names: names, aliases: aliases, dropped: S.worldDropped,
+            source: S.lexiconSource || '未知来源', at: new Date().toLocaleString(),
+        });
     }
 
     function restoreLexicon(lex) {
@@ -273,6 +280,7 @@
         let n = 0;
         lex.aliases.forEach((pair) => { if (Array.isArray(pair) && addAlias(pair[0], pair[1], true)) n++; });
         if (typeof lex.dropped === 'number') S.worldDropped = lex.dropped;
+        if (lex.source) S.lexiconSource = lex.source + (lex.at ? '（' + lex.at + '）' : '');
         log('词表已从存储恢复：别名', n, '条');
         return n;
     }
@@ -489,6 +497,12 @@
         return (ascii || 'chat') + '-' + h.toString(36);
     }
 
+    // 设置、手动别名、词表都属于"世界"，全局共享；只有章节卡按聊天隔离
+    const GLOBAL_KV = new Set(['settings', 'manualAliases', 'lexicon']);
+    function storageKey(key) {
+        return GLOBAL_KV.has(key) ? 'global.' + key : slugify(S.ns) + '.' + key;
+    }
+
     const Store = {
         kind: 'memory',
         tauri: null,
@@ -588,14 +602,14 @@
         },
 
         async saveKV(key, value) {
-            const slug = slugify(S.ns);
+            const k = storageKey(key);
             try {
                 if (this.kind === 'tauri') {
-                    await this.tauri.setJson({ namespace: NS_TAURI, table: 'main', key: slug + '.' + key, value: value });
+                    await this.tauri.setJson({ namespace: NS_TAURI, table: 'main', key: k, value: value });
                     return;
                 }
-                if (this.kind === 'idb') { this.idb(STORE_KV, 'readwrite', (st) => st.put(value, S.ns + '|' + key)); return; }
-                this.mem.kv.set(S.ns + '|' + key, value);
+                if (this.kind === 'idb') { this.idb(STORE_KV, 'readwrite', (st) => st.put(value, k)); return; }
+                this.mem.kv.set(k, value);
             } catch (e) { warn('保存设置失败', e); }
         },
 
@@ -616,10 +630,32 @@
             } catch (e) { warn('清空失败', e); }
         },
 
-        // ---- 读：整条记忆链 ----
+        // ---- 读：整条记忆链（全局 KV + 本聊天的章节） ----
         async loadAll() {
             const slug = slugify(S.ns);
             let cards = [], aliases = null, settings = null, lexicon = null;
+            const getGlobal = async (key) => {
+                if (this.kind === 'tauri') {
+                    let r = await this.tauri.tryGetJson({ namespace: NS_TAURI, table: 'main', key: 'global.' + key });
+                    if (!r || !r.found) r = await this.tauri.tryGetJson({ namespace: NS_TAURI, table: 'main', key: slug + '.' + key }); // 旧版按聊天存，做一次迁移读取
+                    return (r && r.found) ? r.value : null;
+                }
+                if (this.kind === 'idb') {
+                    return await new Promise((resolve) => {
+                        const st = this.db.transaction(STORE_KV, 'readonly').objectStore(STORE_KV);
+                        const req = st.get('global.' + key);
+                        req.onsuccess = () => {
+                            if (req.result !== undefined) { resolve(req.result); return; }
+                            const req2 = st.get(S.ns + '|' + key);
+                            req2.onsuccess = () => resolve(req2.result === undefined ? null : req2.result);
+                            req2.onerror = () => resolve(null);
+                        };
+                        req.onerror = () => resolve(null);
+                    });
+                }
+                if (this.mem.kv.has('global.' + key)) return this.mem.kv.get('global.' + key);
+                return this.mem.kv.get(S.ns + '|' + key) || null;
+            };
             try {
                 if (this.kind === 'tauri') {
                     const meta = await this.tauri.tryGetJson({ namespace: NS_TAURI, table: 'main', key: slug + '.meta' });
@@ -629,34 +665,24 @@
                         const part = await this.tauri.tryGetJson({ namespace: NS_TAURI, table: table, key: 'chunk' + String(i).padStart(4, '0') });
                         if (part && part.found && Array.isArray(part.value)) cards = cards.concat(part.value);
                     }
-                    const a = await this.tauri.tryGetJson({ namespace: NS_TAURI, table: 'main', key: slug + '.manualAliases' });
-                    if (a && a.found) aliases = a.value;
-                    const st = await this.tauri.tryGetJson({ namespace: NS_TAURI, table: 'main', key: slug + '.settings' });
-                    if (st && st.found) settings = st.value;
-                    const lx = await this.tauri.tryGetJson({ namespace: NS_TAURI, table: 'main', key: slug + '.lexicon' });
-                    if (lx && lx.found) lexicon = lx.value;
+                    aliases = await getGlobal('manualAliases');
+                    settings = await getGlobal('settings');
+                    lexicon = await getGlobal('lexicon');
                 } else if (this.kind === 'idb') {
-                    const got = await new Promise((resolve) => {
-                        const t = this.db.transaction([STORE_CARDS, STORE_KV], 'readonly');
-                        const out = { cards: [], aliases: null, settings: null, lexicon: null };
-                        const reqC = t.objectStore(STORE_CARDS).index('ns').getAll(S.ns);
-                        const reqA = t.objectStore(STORE_KV).get(S.ns + '|manualAliases');
-                        const reqS = t.objectStore(STORE_KV).get(S.ns + '|settings');
-                        const reqL = t.objectStore(STORE_KV).get(S.ns + '|lexicon');
-                        reqC.onsuccess = () => { out.cards = reqC.result || []; };
-                        reqA.onsuccess = () => { out.aliases = reqA.result || null; };
-                        reqS.onsuccess = () => { out.settings = reqS.result || null; };
-                        reqL.onsuccess = () => { out.lexicon = reqL.result || null; };
-                        t.oncomplete = () => resolve(out);
-                        t.onerror = () => resolve(out);
-                        t.onabort = () => resolve(out);
+                    cards = await new Promise((resolve) => {
+                        const req = this.idb(STORE_CARDS, 'readonly', (st) => st.index('ns').getAll(S.ns));
+                        if (!req) { resolve([]); return; }
+                        req.onsuccess = () => resolve(req.result || []);
+                        req.onerror = () => resolve([]);
                     });
-                    cards = got.cards; aliases = got.aliases; settings = got.settings; lexicon = got.lexicon;
+                    aliases = await getGlobal('manualAliases');
+                    settings = await getGlobal('settings');
+                    lexicon = await getGlobal('lexicon');
                 } else {
                     this.mem.cards.forEach((v, k) => { if (k.indexOf(S.ns + '|') === 0) cards.push(v); });
-                    aliases = this.mem.kv.get(S.ns + '|manualAliases') || null;
-                    settings = this.mem.kv.get(S.ns + '|settings') || null;
-                    lexicon = this.mem.kv.get(S.ns + '|lexicon') || null;
+                    aliases = await getGlobal('manualAliases');
+                    settings = await getGlobal('settings');
+                    lexicon = await getGlobal('lexicon');
                 }
             } catch (e) { warn('读取记忆失败，按空记忆启动', e); }
 
@@ -688,6 +714,48 @@
     const persistCard = (card) => { Store.saveCard(card); };
     const persistKV = (key, value) => { Store.saveKV(key, value); };
     const loadAll = () => Store.loadAll();
+
+    // ---------------------------------------------------------------- 从宿主读取世界书
+    function boundWorldBookNames() {
+        const names = new Set();
+        const push = (v) => { if (v && typeof v === 'string') names.add(v); };
+        const meta = ctx.chatMetadata || {};
+        push(meta.world_info);
+        push(meta.world_info_name);
+        if (Array.isArray(meta.world_info_list)) meta.world_info_list.forEach(push);
+        if (ctx.powerUserSettings) {
+            push(ctx.powerUserSettings.world_info);
+            push(ctx.powerUserSettings.world_info_name);
+        }
+        push(ctx.world_info);
+        push(ctx.worldInfo);
+        return Array.from(names);
+    }
+
+    async function fetchBoundWorldInfo() {
+        const names = boundWorldBookNames();
+        if (!names.length) { log('宿主没有已绑定的世界书名'); return null; }
+        let headers = { 'Content-Type': 'application/json' };
+        try {
+            if (typeof ctx.getRequestHeaders === 'function') headers = ctx.getRequestHeaders();
+            else if (typeof getRequestHeaders === 'function') headers = getRequestHeaders();
+        } catch (e) { /* 用默认头 */ }
+        const merged = { entries: {} };
+        let uid = 0, ok = 0;
+        for (const name of names) {
+            try {
+                const res = await fetch('/api/worldinfo/get', { method: 'POST', headers: headers, body: JSON.stringify({ name: name }) });
+                if (!res.ok) { warn('读取世界书失败', name, res.status); continue; }
+                const data = await res.json();
+                const ents = data && data.entries ? (Array.isArray(data.entries) ? data.entries : Object.values(data.entries)) : [];
+                if (!ents.length) continue;
+                for (const e of ents) merged.entries[String(uid++)] = e;
+                ok++;
+                log('已读取世界书', name, ents.length, '条');
+            } catch (e) { warn('读取世界书异常', name, e); }
+        }
+        return ok ? merged : null;
+    }
 
     // ---------------------------------------------------------------- 摘要（异步、低优先）
     function buildSummaryPrompt(fromIdx) {
@@ -825,16 +893,32 @@
       <div class="mc-row"><span>注入深度</span><input id="mc-depth" type="number" min="0" max="50"></div>
 
       <hr>
-      <div class="mc-row"><span>世界书 JSON</span><input id="mc-file" type="file" accept=".json"></div>
-      <div class="mc-hint">导入 <code>今山 6.json</code> 可自动生成实体表（comment=实体，key=别名，通用词自动丢弃）。</div>
-      <div class="mc-row"><span>手动别名</span></div>
-      <textarea id="mc-aliases" rows="4" placeholder="苓公子 => 茯苓&#10;宵塔主 => 茯宵"></textarea>
-      <div class="mc-buttons">
-        <button id="mc-save-aliases" class="menu_button">保存别名</button>
-        <button id="mc-chapter" class="menu_button">记录本章</button>
-        <button id="mc-export" class="menu_button">导出记忆</button>
-        <button id="mc-import" class="menu_button">导入记忆</button>
-        <button id="mc-clear" class="menu_button">清空本章记忆</button>
+      <div class="mc-box">
+        <div class="mc-box-title">① 词表（世界书）——必须先做这一步</div>
+        <div id="mc-lex-status" class="mc-lex-status"></div>
+        <div class="mc-buttons">
+          <button id="mc-pick-file" class="menu_button">选择世界书 JSON 文件…</button>
+          <button id="mc-pull-wi" class="menu_button">从当前绑定的世界书读取</button>
+          <button id="mc-paste-toggle" class="menu_button">粘贴 JSON…</button>
+        </div>
+        <input id="mc-file" type="file" accept=".json,application/json" style="display:none">
+        <div id="mc-paste-wrap" style="display:none">
+          <textarea id="mc-paste" rows="3" placeholder='把 今山 8.json 的全部内容粘贴到这里，或只粘贴 { "entries": { ... } } 这一部分'></textarea>
+          <button id="mc-parse-paste" class="menu_button">解析并建表</button>
+        </div>
+        <div class="mc-hint">comment = 实体名，key = 别名；过泛的通用词会自动丢弃。导入一次即长期有效（全局共享，换角色/换存档不用重来）。</div>
+      </div>
+
+      <div class="mc-box">
+        <div class="mc-box-title">② 手动别名（可选）</div>
+        <textarea id="mc-aliases" rows="4" placeholder="苓公子 => 茯苓&#10;宵塔主 => 茯宵"></textarea>
+        <div class="mc-buttons">
+          <button id="mc-save-aliases" class="menu_button">保存别名</button>
+          <button id="mc-chapter" class="menu_button">记录本章</button>
+          <button id="mc-export" class="menu_button">导出记忆</button>
+          <button id="mc-import" class="menu_button">导入记忆</button>
+          <button id="mc-clear" class="menu_button">清空本章记忆</button>
+        </div>
       </div>
       <input id="mc-import-file" type="file" accept=".json" style="display:none">
       <label class="checkbox_label"><input id="mc-debug" type="checkbox"><span>调试日志</span></label>
@@ -843,8 +927,23 @@
     </div>
   </div>
 </div>`;
-        $('#extensions_settings').append(html);
-        $panel = $('.memory-chain-settings');
+        // 挂载：依次尝试常见设置容器；全都找不到就用浮动面板兜底（绝不至于"找不到入口"）
+        const containers = ['#extensions_settings', '#extensions_settings2', '#extensions-settings', '#rm_extensions_block'];
+        let mounted = null;
+        for (const sel of containers) {
+            const el = $(sel);
+            if (el && el.length) { el.append(html); mounted = sel; break; }
+        }
+        if (!mounted) {
+            const fab = $('<div id="mc-fab" title="记忆链设置">记忆链</div>');
+            const host = $('<div id="mc-float-host" class="memory-chain-settings"></div>');
+            host.html(html);
+            $('body').append(fab).append(host);
+            fab.on('click', () => host.toggleClass('mc-open'));
+            mounted = '#mc-float-host（兜底浮动面板）';
+        }
+        log('设置面板挂载点：' + mounted);
+        $panel = $('.memory-chain-settings').last();
 
         const bind = (sel, key, type, after) => {
             const el = $panel.find(sel);
@@ -885,12 +984,33 @@
             const rd = new FileReader();
             rd.onload = () => {
                 try {
-                    const r = buildFromWorldBook(JSON.parse(String(rd.result)));
+                    const r = buildFromWorldBook(JSON.parse(String(rd.result)), '文件：' + f.name);
                     renderStats();
-                    toast(`实体 ${r.entities} 个 / 别名 ${r.aliases} 条（丢弃通用词 ${r.dropped}）`);
+                    toast(`词表已建立：实体 ${r.entities} / 别名 ${r.aliases}（过滤 ${r.dropped + r.stopped}）`);
                 } catch (e) { toast('导入失败：' + e.message, true); }
             };
             rd.readAsText(f, 'utf-8');
+        });
+        $panel.find('#mc-pick-file').on('click', () => $panel.find('#mc-file').trigger('click'));
+        $panel.find('#mc-paste-toggle').on('click', () => $panel.find('#mc-paste-wrap').toggle());
+        $panel.find('#mc-parse-paste').on('click', () => {
+            const txt = String($panel.find('#mc-paste').val() || '').trim();
+            if (!txt) { toast('先粘贴世界书 JSON 内容', true); return; }
+            try {
+                const r = buildFromWorldBook(JSON.parse(txt), '粘贴导入');
+                renderStats();
+                toast(`词表已建立：实体 ${r.entities} / 别名 ${r.aliases}（过滤 ${r.dropped + r.stopped}）`);
+            } catch (e) { toast('解析失败：' + e.message, true); }
+        });
+        $panel.find('#mc-pull-wi').on('click', async () => {
+            toast('正在从宿主读取世界书…');
+            const json = await fetchBoundWorldInfo();
+            if (!json) { toast('没读到已绑定的世界书，请改用「选择世界书 JSON 文件…」', true); return; }
+            try {
+                const r = buildFromWorldBook(json, '宿主世界书');
+                renderStats();
+                toast(`词表已建立：实体 ${r.entities} / 别名 ${r.aliases}`);
+            } catch (e) { toast('建表失败：' + e.message, true); }
         });
 
         $panel.find('#mc-chapter').on('click', () => {
@@ -953,11 +1073,24 @@
         const s = S.stats;
         const storeLabel = { tauri: 'TauriTavern store', idb: 'IndexedDB', memory: '内存（不持久）' }[Store.kind] || Store.kind;
         $panel.find('#mc-stats').text(
-            `存储：${storeLabel} · 命名空间 ${slugify(S.ns)}` +
+            `存储：${storeLabel} · 本聊天命名空间 ${slugify(S.ns)}` +
             `\n章节 ${s.chapters} · 实体 ${s.entities} · 别名 ${s.aliases} · 过滤词 ${S.worldDropped}` +
             `\n上轮：命中 ${s.matched} 实体 / 候选 ${s.candidates} / 注入 ${s.injected} 字 / 耗时 ${s.lastMs} ms ${s.lastAt}`
         );
         $panel.find('#mc-warn').text(Store.kind === 'memory' ? '⚠ ' + (S.storeNote || '当前环境无法持久化，记忆仅本次会话有效') : '');
+        renderLexiconStatus();
+    }
+
+    function renderLexiconStatus() {
+        if (!$panel || !$panel.length) return;
+        const el = $panel.find('#mc-lex-status');
+        if (!el.length) return;
+        const e = S.entities.size, n = S.aliasMap.size;
+        if (!e) {
+            el.html('<span class="mc-bad">尚未导入世界书 —— 词表为空，记忆链不会召回任何往事。请用下面任意一种方式导入。</span>');
+            return;
+        }
+        el.text(`✅ 词表就绪：实体 ${e} · 别名 ${n}　来源：${S.lexiconSource || '已导入'}`);
     }
 
     function toast(msg, isErr) {
@@ -1029,6 +1162,18 @@
         bindEvents();
         renderStats();
         console.log('[记忆链] 就绪：存储', Store.kind, '・章节', S.chapters.length, '实体', S.entities.size, '别名', S.aliasMap.size);
+
+        // 词表为空时，自动尝试从宿主已绑定的世界书建立（失败了也不打扰）
+        if (!S.entities.size) {
+            fetchBoundWorldInfo().then((json) => {
+                if (!json) return;
+                try {
+                    const r = buildFromWorldBook(json, '宿主世界书（自动）');
+                    renderStats();
+                    toast(`已自动建立词表：实体 ${r.entities} / 别名 ${r.aliases}`);
+                } catch (e) { log('自动建表失败', e); }
+            });
+        }
     }
 
     // 调试出口（也可在控制台手动调用）

@@ -51,3 +51,69 @@
     font-size: 0.8em;
     margin-top: 4px;
 }
+
+/* 词表导入区：必须一眼能看到 */
+.memory-chain-settings .mc-box {
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 6px;
+    padding: 8px;
+    margin: 8px 0;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.memory-chain-settings .mc-box-title {
+    font-weight: 600;
+    font-size: 0.9em;
+    margin-bottom: 6px;
+    opacity: 0.95;
+}
+
+.memory-chain-settings .mc-lex-status {
+    font-size: 0.85em;
+    margin-bottom: 6px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+}
+
+.memory-chain-settings .mc-bad {
+    color: #e0793a;
+}
+
+.memory-chain-settings #mc-paste-wrap textarea {
+    width: 100%;
+    margin-bottom: 6px;
+}
+
+/* 兜底浮动面板（找不到设置容器时才出现） */
+#mc-fab {
+    position: fixed;
+    left: 10px;
+    bottom: 84px;
+    z-index: 4000;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: rgba(30, 30, 34, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #eee;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+#mc-float-host {
+    display: none;
+    position: fixed;
+    left: 10px;
+    bottom: 120px;
+    width: 340px;
+    max-height: 70vh;
+    overflow: auto;
+    z-index: 3999;
+    background: rgba(24, 24, 28, 0.97);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 8px;
+    padding: 8px;
+}
+
+#mc-float-host.mc-open {
+    display: block;
+}
