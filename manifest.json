@@ -1,0 +1,12 @@
+{
+    "display_name": "记忆链 MemoryChain（实体索引记忆）",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "JINSHAN",
+    "version": "1.1.0",
+    "homePage": "",
+    "auto_update": false
+}

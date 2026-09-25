@@ -1,0 +1,14 @@
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# 依赖与构建（本扩展无构建步骤，仅防误入）
+node_modules/
+dist/
+*.log
+
+# 运行时导出（记忆链导出的 JSON，属于用户数据，不入库）
+memory-chain-*.json

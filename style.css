@@ -1,0 +1,53 @@
+.memory-chain-settings .mc-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0;
+}
+
+.memory-chain-settings .mc-row > span {
+    flex: 0 0 46%;
+    font-size: 0.9em;
+    opacity: 0.9;
+}
+
+.memory-chain-settings .mc-row input[type="number"],
+.memory-chain-settings .mc-row select {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.memory-chain-settings textarea {
+    width: 100%;
+    font-family: monospace;
+    font-size: 0.85em;
+}
+
+.memory-chain-settings .mc-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 8px 0;
+}
+
+.memory-chain-settings .mc-hint {
+    font-size: 0.8em;
+    opacity: 0.75;
+    margin: 2px 0 8px;
+}
+
+.memory-chain-settings .mc-stats {
+    white-space: pre-wrap;
+    font-family: monospace;
+    font-size: 0.8em;
+    background: rgba(0, 0, 0, 0.15);
+    border-radius: 4px;
+    padding: 6px;
+    margin-top: 8px;
+}
+
+.memory-chain-settings .mc-warn {
+    color: #d9a24a;
+    font-size: 0.8em;
+    margin-top: 4px;
+}
