@@ -39,7 +39,31 @@
         genericKeyLimit: 3,     // 某关键词出现在 > N 个条目里 → 视为通用词，丢弃
         minAliasLen: 2,
         debug: false,
+        // —— 剧情闸门（v1.3）——
+        gateEnabled: true,
+        gateAutoApply: false,        // 默认"检测后等确认"，避免误判直接改书
+        gateScanTurns: 4,
+        gateBook: '',                // 留空=自动取当前聊天绑定的世界书
+        gateStripPrefix: true,       // 解锁时去掉条目前的【未解锁】
+        milestones: null,            // null = 用内置预设
     };
+
+    // 内置里程碑预设（对话里出现"全部词 + 任一动词"即判定达成）
+    const PRESET_MILESTONES = [
+        { id: 'luofu-land', label: '落茯区购得', all: ['落茯区'], any: ['买下', '购得', '盘下', '买定', '成交', '置下', '入手', '交割'], unlock: ['【未解锁】落茯区'],
+          patch: [['· 落茯区：神都西市西城门外那块三角形滩涂**尚未购得**。', '· 落茯区：已于{time}购得（营建中）。']] },
+        { id: 'luofu-xuan', label: '落茯轩翻新动工', all: ['落茯轩'], any: ['翻新动工', '翻新开工', '改建动工', '动工翻新'], unlock: ['【未解锁】落茯轩翻新'], patch: [] },
+        { id: 'luofu-stock', label: '落茯券股与落茯快报开办', all: [], any: ['落茯券股开', '落茯快报创', '落茯快报开', '券股挂牌', '快报出刊'], unlock: ['【未解锁】落茯券股与落茯快报'], patch: [] },
+        { id: 'luofu-fresh', label: '落茯鲜供与落茯站港开办', all: [], any: ['落茯鲜供开', '落茯站开', '落茯港通', '落茯港启用'], unlock: ['【未解锁】落茯鲜供与落茯站港'], patch: [] },
+        { id: 'shendu-heart', label: '神都之心落成', all: ['神都之心'], any: ['落成', '封顶', '建成', '亮灯'], unlock: ['【未解锁】神都之心'], patch: [] },
+        { id: 'luofu-bank', label: '落茯中央银行设立', all: [], any: ['落茯中央银行设', '落茯央行设', '落茯中央银行开', '落茯央行开'], unlock: ['【未解锁】落茯中央银行'], patch: [] },
+        { id: 'ideal-city', label: '接管月瑶郡·理想城动工', all: [], any: ['接管月瑶郡', '月瑶郡归', '理想城动工', '理想城开工', '东方之门动工'], unlock: ['【未解锁】理想城'],
+          patch: [['· 理想城（东方之门）：月瑶郡**尚未接管**，它仍是纸上的计划。', '· 理想城（东方之门）：月瑶郡已于{time}接管，理想城进入营建。']] },
+        { id: 'kowloon', label: '购得九龙洲·九龙港', all: [], any: ['买下九龙', '购得九龙', '九龙洲入', '九龙交割', '九龙港启用', '九龙港通航', '九龙港建成'], unlock: ['【未解锁】九龙洲与九龙港'],
+          patch: [['· 九龙港：九龙洲**尚未购得**，今山没有自己的海港与远洋航线。', '· 九龙港：九龙洲已于{time}购得，今山自此有自己的海港与远洋航线。']] },
+        { id: 'overseas', label: '海外拓殖（黑龙郡等）', all: [], any: ['黑龙郡设', '黑龙郡立', '南岸郡设', '南陆岛设', '南陆岛郡设', '海外拓殖'], unlock: ['【未解锁】海外拓殖'],
+          patch: [['· 黑龙郡、南岸郡、南陆岛郡等海外拓殖：**尚未发生**。', '· 海外拓殖：黑龙郡、南岸郡、南陆岛郡等已于{time}先后设立。']] },
+    ];
 
     // 兜底停用词（自动通用词过滤之外再挡一层）
     const STOPWORDS = new Set([
@@ -94,6 +118,9 @@
         lexicon: null,              // 持久化的世界书词表 { names:[], aliases:[[alias,name]] }
         worldDropped: 0,
         lexiconSource: '',
+        milestonesSource: '',
+        pending: [],                 // 待确认的里程碑
+        unlocked: {},                // 已解锁里程碑 {id:{label,at,changed,book}}
         maxHits: 1,
         turnsSinceChapter: 0,
         cache: { key: '', block: '' },
@@ -206,6 +233,9 @@
         const entries = json && json.entries ? json.entries : null;
         if (!entries) throw new Error('不是世界书 JSON（缺少 entries）');
         const list = Array.isArray(entries) ? entries : Object.values(entries);
+        // 重建词表：每次导入都从零开始，避免旧映射（例如解锁前的"进度条"归属）残留
+        S.entities.clear();
+        S.aliasMap.clear();
         const keyFreq = new Map();
         for (const en of list) {
             if (en.disable) continue;                  // 解锁包（未解锁内容）不算词频
@@ -236,6 +266,8 @@
         S.worldDropped = dropped + stopped;
         S.manualAliases.forEach((m) => addAlias(m.alias, m.name, true));
         rebuildAutomaton();
+        // 实体表已重建 → 已有章节卡需要重新打标
+        S.chapters.forEach((c) => { c.ents = []; indexCard(c); });
         saveLexicon(source);
         syncStats();
         renderLexiconStatus();
@@ -500,7 +532,7 @@
     }
 
     // 设置、手动别名、词表都属于"世界"，全局共享；只有章节卡按聊天隔离
-    const GLOBAL_KV = new Set(['settings', 'manualAliases', 'lexicon']);
+    const GLOBAL_KV = new Set(['settings', 'manualAliases', 'lexicon', 'gateUnlocked']);
     function storageKey(key) {
         return GLOBAL_KV.has(key) ? 'global.' + key : slugify(S.ns) + '.' + key;
     }
@@ -632,32 +664,36 @@
             } catch (e) { warn('清空失败', e); }
         },
 
+        // ---- 读：单个全局键（带旧版按聊天键的迁移回退） ----
+        async loadKV(key) {
+            const slug = slugify(S.ns);
+            if (this.kind === 'tauri') {
+                let r = await this.tauri.tryGetJson({ namespace: NS_TAURI, table: 'main', key: 'global.' + key });
+                if (!r || !r.found) r = await this.tauri.tryGetJson({ namespace: NS_TAURI, table: 'main', key: slug + '.' + key });
+                return (r && r.found) ? r.value : null;
+            }
+            if (this.kind === 'idb') {
+                return await new Promise((resolve) => {
+                    const st = this.db.transaction(STORE_KV, 'readonly').objectStore(STORE_KV);
+                    const req = st.get('global.' + key);
+                    req.onsuccess = () => {
+                        if (req.result !== undefined) { resolve(req.result); return; }
+                        const req2 = st.get(S.ns + '|' + key);
+                        req2.onsuccess = () => resolve(req2.result === undefined ? null : req2.result);
+                        req2.onerror = () => resolve(null);
+                    };
+                    req.onerror = () => resolve(null);
+                });
+            }
+            if (this.mem.kv.has('global.' + key)) return this.mem.kv.get('global.' + key);
+            return this.mem.kv.get(S.ns + '|' + key) || null;
+        },
+
         // ---- 读：整条记忆链（全局 KV + 本聊天的章节） ----
         async loadAll() {
             const slug = slugify(S.ns);
             let cards = [], aliases = null, settings = null, lexicon = null;
-            const getGlobal = async (key) => {
-                if (this.kind === 'tauri') {
-                    let r = await this.tauri.tryGetJson({ namespace: NS_TAURI, table: 'main', key: 'global.' + key });
-                    if (!r || !r.found) r = await this.tauri.tryGetJson({ namespace: NS_TAURI, table: 'main', key: slug + '.' + key }); // 旧版按聊天存，做一次迁移读取
-                    return (r && r.found) ? r.value : null;
-                }
-                if (this.kind === 'idb') {
-                    return await new Promise((resolve) => {
-                        const st = this.db.transaction(STORE_KV, 'readonly').objectStore(STORE_KV);
-                        const req = st.get('global.' + key);
-                        req.onsuccess = () => {
-                            if (req.result !== undefined) { resolve(req.result); return; }
-                            const req2 = st.get(S.ns + '|' + key);
-                            req2.onsuccess = () => resolve(req2.result === undefined ? null : req2.result);
-                            req2.onerror = () => resolve(null);
-                        };
-                        req.onerror = () => resolve(null);
-                    });
-                }
-                if (this.mem.kv.has('global.' + key)) return this.mem.kv.get('global.' + key);
-                return this.mem.kv.get(S.ns + '|' + key) || null;
-            };
+            const getGlobal = (key) => this.loadKV(key);
             try {
                 if (this.kind === 'tauri') {
                     const meta = await this.tauri.tryGetJson({ namespace: NS_TAURI, table: 'main', key: slug + '.meta' });
@@ -757,6 +793,152 @@
             } catch (e) { warn('读取世界书异常', name, e); }
         }
         return ok ? merged : null;
+    }
+
+    // ---------------------------------------------------------------- 剧情闸门（v1.3）
+    function milestones() {
+        const m = S.settings.milestones;
+        return Array.isArray(m) && m.length ? m : PRESET_MILESTONES;
+    }
+
+    function gateText() {
+        const chat = ctx.chat || [];
+        const n = clamp(Number(S.settings.gateScanTurns) || 4, 1, 20);
+        const parts = [];
+        for (let i = Math.max(0, chat.length - n); i < chat.length; i++) {
+            const m = chat[i];
+            if (!m || m.is_system) continue;
+            parts.push(String(m.mes || ''));
+        }
+        return parts.join('\n');
+    }
+
+    function matchMilestone(ms, text) {
+        if (!ms || !ms.id) return false;
+        const all = Array.isArray(ms.all) ? ms.all : [];
+        for (const k of all) { if (k && text.indexOf(k) < 0) return false; }
+        const any = Array.isArray(ms.any) ? ms.any : [];
+        if (all.length === 0 && any.length === 0) return false;
+        if (any.length === 0) return true;
+        return any.some((k) => k && text.indexOf(k) >= 0);
+    }
+
+    function evidenceSnippet(ms, text) {
+        const keys = [].concat(Array.isArray(ms.any) ? ms.any : [], Array.isArray(ms.all) ? ms.all : []);
+        for (const k of keys) {
+            const i = k ? text.indexOf(k) : -1;
+            if (i >= 0) return text.slice(Math.max(0, i - 30), i + 60).replace(/\s+/g, ' ').trim();
+        }
+        return text.slice(0, 80);
+    }
+
+    function stampNow() {
+        const d = new Date();
+        return d.toLocaleDateString() + ' ' + d.toLocaleTimeString().slice(0, 5);
+    }
+
+    function unlockedBlock() {
+        const items = Object.keys(S.unlocked).map((id) => '· ' + S.unlocked[id].label + '（' + S.unlocked[id].at + '）');
+        return '— 已解锁（剧情推进） —\n' + (items.length ? items.join('\n') : '· （暂无）');
+    }
+
+    function upsertUnlockedBlock(content) {
+        const parts = String(content).split(/\n\n(?=—)/);
+        const idx = parts.findIndex((p) => p.indexOf('— 已解锁') === 0);
+        if (idx >= 0) parts[idx] = unlockedBlock(); else parts.push(unlockedBlock());
+        return parts.join('\n\n');
+    }
+
+    async function hostBookName() {
+        const manual = String(S.settings.gateBook || '').trim();
+        if (manual) return manual;
+        const names = boundWorldBookNames();
+        return names.length ? names[0] : null;
+    }
+
+    function hostHeaders() {
+        try {
+            if (typeof ctx.getRequestHeaders === 'function') return ctx.getRequestHeaders();
+            if (typeof getRequestHeaders === 'function') return getRequestHeaders();
+        } catch (e) { /* ignore */ }
+        return { 'Content-Type': 'application/json' };
+    }
+
+    async function hostReadBook(name) {
+        const res = await fetch('/api/worldinfo/get', { method: 'POST', headers: hostHeaders(), body: JSON.stringify({ name: name }) });
+        if (!res.ok) throw new Error('读取世界书失败 HTTP ' + res.status);
+        return await res.json();
+    }
+
+    async function hostWriteBook(name, data) {
+        const res = await fetch('/api/worldinfo/edit', { method: 'POST', headers: hostHeaders(), body: JSON.stringify({ name: name, data: data }) });
+        if (!res.ok) throw new Error('写入世界书失败 HTTP ' + res.status);
+        return true;
+    }
+
+    function reloadHostWorldInfo() {
+        try {
+            if (typeof ctx.loadWorldInfo === 'function') { ctx.loadWorldInfo(); return true; }
+            if (typeof window !== 'undefined' && typeof window.loadWorldInfo === 'function') { window.loadWorldInfo(); return true; }
+        } catch (e) { /* ignore */ }
+        return false;
+    }
+
+    async function applyMilestone(ms, decl) {
+        const name = await hostBookName();
+        if (!name) { toast('闸门：没找到世界书名，请在闸门设置里手填', true); return false; }
+        let book;
+        try { book = await hostReadBook(name); } catch (e) { toast('闸门：' + e.message, true); return false; }
+        const list = Array.isArray(book.entries) ? book.entries : Object.values(book.entries || {});
+        const changed = [];
+        for (const target of (ms.unlock || [])) {
+            const hit = list.find((e) => String(e.comment || '').trim() === String(target).trim());
+            if (!hit) continue;
+            if (hit.disable) { hit.disable = false; changed.push(hit.comment); }
+            if (S.settings.gateStripPrefix && /^【未解锁】/.test(String(hit.comment))) {
+                hit.comment = String(hit.comment).replace(/^【未解锁】/, '');
+            }
+            hit.order = 100;
+            if (hit.extensions) hit.extensions.order = 100;
+        }
+        const stamp = stampNow();
+        const prog = list.find((e) => String(e.comment || '').trim() === '开局状态与剧情进度');
+        if (prog) {
+            let c = String(prog.content || '');
+            for (const pair of (ms.patch || [])) {
+                if (Array.isArray(pair) && pair.length === 2 && c.indexOf(pair[0]) >= 0) c = c.replace(pair[0], pair[1].replace('{time}', stamp));
+            }
+            prog.content = upsertUnlockedBlock(c);
+        }
+        try { await hostWriteBook(name, book); } catch (e) { toast('闸门：' + e.message, true); return false; }
+        S.unlocked[ms.id] = { label: ms.label, at: stamp, changed: changed, book: name };
+        persistKV('gateUnlocked', S.unlocked);
+        S.pending = S.pending.filter((p) => p.id !== ms.id);
+        rebuildAutomaton();
+        try { buildFromWorldBook(book, '宿主世界书（闸门：' + ms.label + '）'); } catch (e) { log('闸门后重建词表失败', e); }
+        const reloaded = reloadHostWorldInfo();
+        toast('闸门已解锁：' + ms.label + '（启用 ' + changed.length + ' 条）' + (reloaded ? '' : '；建议刷新页面让宿主重载世界书'));
+        renderGate();
+        return true;
+    }
+
+    function gateScan(force) {
+        if (!S.settings.gateEnabled && !force) return 0;
+        const text = gateText();
+        if (!text) return 0;
+        let found = 0;
+        for (const ms of milestones()) {
+            if (!ms || !ms.id || S.unlocked[ms.id]) continue;
+            if (S.pending.some((p) => p.id === ms.id)) continue;
+            if (!matchMilestone(ms, text)) continue;
+            const decl = { id: ms.id, label: ms.label, evidence: evidenceSnippet(ms, text) };
+            S.pending.push(decl);
+            found++;
+            if (S.settings.gateAutoApply) applyMilestone(ms, decl);
+            else toast('闸门检测到里程碑「' + ms.label + '」，请在记忆链面板确认');
+        }
+        if (found) renderGate();
+        return found;
     }
 
     // ---------------------------------------------------------------- 摘要（异步、低优先）
@@ -912,7 +1094,28 @@
       </div>
 
       <div class="mc-box">
-        <div class="mc-box-title">② 手动别名（可选）</div>
+        <div class="mc-box-title">③ 剧情闸门（按剧情自动解锁世界书条目）</div>
+        <label class="checkbox_label"><input id="mc-gate-on" type="checkbox"><span>启用检测（每轮回复后扫描最近对话）</span></label>
+        <label class="checkbox_label"><input id="mc-gate-auto" type="checkbox"><span>自动应用（关＝先在下面确认再解锁）</span></label>
+        <div class="mc-row"><span>扫描最近轮数</span><input id="mc-gate-turns" type="number" min="1" max="20"></div>
+        <div class="mc-row"><span>世界书名（留空＝自动取绑定书）</span><input id="mc-gate-book" type="text" placeholder="今山·整合版 v9"></div>
+        <label class="checkbox_label"><input id="mc-gate-strip" type="checkbox"><span>解锁时去掉条目前的【未解锁】</span></label>
+        <div id="mc-gate-pending" class="mc-gate-pending"></div>
+        <div id="mc-gate-log" class="mc-gate-log"></div>
+        <div class="mc-buttons">
+          <button id="mc-gate-scan" class="menu_button">立即扫描</button>
+          <button id="mc-gate-edit" class="menu_button">编辑里程碑</button>
+          <button id="mc-gate-reset" class="menu_button">清空已解锁记录</button>
+        </div>
+        <div id="mc-gate-json-wrap" style="display:none">
+          <textarea id="mc-gate-json" rows="5"></textarea>
+          <button id="mc-gate-save" class="menu_button">保存里程碑</button>
+        </div>
+        <div class="mc-hint">判定规则：<b>必须全部出现</b>的词（all）＋ <b>任选其一</b>的动词（any）。应用后会写回世界书文件、同步改写「开局状态与剧情进度」，并重建词表。</div>
+      </div>
+
+      <div class="mc-box">
+        <div class="mc-box-title">④ 手动别名（可选）</div>
         <textarea id="mc-aliases" rows="4" placeholder="苓公子 => 茯苓&#10;宵塔主 => 茯宵"></textarea>
         <div class="mc-buttons">
           <button id="mc-save-aliases" class="menu_button">保存别名</button>
@@ -970,6 +1173,39 @@
         bind('#mc-position', 'position', 'str');
         bind('#mc-depth', 'depth', 'num');
         bind('#mc-debug', 'debug', 'bool');
+        bind('#mc-gate-on', 'gateEnabled', 'bool');
+        bind('#mc-gate-auto', 'gateAutoApply', 'bool');
+        bind('#mc-gate-turns', 'gateScanTurns', 'num');
+        bind('#mc-gate-book', 'gateBook', 'str');
+        bind('#mc-gate-strip', 'gateStripPrefix', 'bool');
+
+        // —— 剧情闸门 ——
+        $panel.find('#mc-gate-scan').on('click', () => {
+            const n = gateScan(true);
+            toast(n ? ('扫描到 ' + n + ' 个候选里程碑（见下方）') : '本次扫描未发现新里程碑');
+        });
+        $panel.find('#mc-gate-edit').on('click', () => {
+            const wrap = $panel.find('#mc-gate-json-wrap');
+            if (wrap.is(':hidden')) $panel.find('#mc-gate-json').val(JSON.stringify(milestones(), null, 1));
+            wrap.toggle();
+        });
+        $panel.find('#mc-gate-save').on('click', () => {
+            try {
+                const arr = JSON.parse(String($panel.find('#mc-gate-json').val() || '[]'));
+                if (!Array.isArray(arr)) throw new Error('必须是数组');
+                S.settings.milestones = arr;
+                saveSettings();
+                toast('里程碑已保存（' + arr.length + ' 条）');
+                renderGate();
+            } catch (e) { toast('JSON 解析失败：' + e.message, true); }
+        });
+        $panel.find('#mc-gate-reset').on('click', () => {
+            S.unlocked = {};
+            S.pending = [];
+            persistKV('gateUnlocked', S.unlocked);
+            renderGate();
+            toast('已清空已解锁记录（世界书里的条目不会被改回去）');
+        });
 
         $panel.find('#mc-aliases').val(S.manualAliases.map((m) => m.alias + ' => ' + m.name).join('\n'));
         $panel.find('#mc-save-aliases').on('click', () => {
@@ -1070,6 +1306,36 @@
         renderStats();
     }
 
+    function renderGate() {
+        if (!$panel || !$panel.length) return;
+        const pend = $panel.find('#mc-gate-pending');
+        const log = $panel.find('#mc-gate-log');
+        if (pend.length) {
+            pend.empty();
+            if (S.pending.length) {
+                pend.append($('<div class="mc-gate-title">待确认的里程碑</div>'));
+                S.pending.forEach((p) => {
+                    const row = $('<div class="mc-gate-item"></div>');
+                    row.append($('<div></div>').text('🔔 ' + p.label + '　证据："' + p.evidence + '"'));
+                    const ok = $('<button class="menu_button">应用解锁</button>').on('click', async () => {
+                        const ms = milestones().find((x) => x.id === p.id);
+                        if (ms) await applyMilestone(ms, p);
+                    });
+                    const no = $('<button class="menu_button">忽略</button>').on('click', () => {
+                        S.pending = S.pending.filter((x) => x.id !== p.id);
+                        renderGate();
+                    });
+                    row.append(ok).append(no);
+                    pend.append(row);
+                });
+            }
+        }
+        if (log.length) {
+            const items = Object.keys(S.unlocked).map((id) => '· ' + S.unlocked[id].label + '（' + S.unlocked[id].at + '，启用 ' + (S.unlocked[id].changed || []).length + ' 条）');
+            log.text(items.length ? ('已解锁：\n' + items.join('\n')) : '已解锁：（暂无）');
+        }
+    }
+
     function renderStats() {
         if (!$panel || !$panel.length) return;
         const s = S.stats;
@@ -1125,7 +1391,10 @@
         else if (event_types.USER_MESSAGE_RENDERED) eventSource.on(event_types.USER_MESSAGE_RENDERED, onSent);
 
         if (event_types.GENERATION_ENDED) {
-            eventSource.on(event_types.GENERATION_ENDED, () => { maybeAutoChapter(false); });
+            eventSource.on(event_types.GENERATION_ENDED, () => {
+                maybeAutoChapter(false);
+                try { gateScan(false); } catch (e) { warn('闸门扫描失败', e); }
+            });
         }
         if (event_types.CHAT_CHANGED) {
             eventSource.on(event_types.CHAT_CHANGED, async () => {
@@ -1156,6 +1425,8 @@
         buildUI();
         await Store.init();
         await loadAll();
+        const gu = await Store.loadKV('gateUnlocked');
+        if (gu && typeof gu === 'object') S.unlocked = gu;
         if (S.lexicon) restoreLexicon(S.lexicon);
         S.manualAliases.forEach((m) => addAlias(m.alias, m.name, true));
         rebuildAutomaton();
@@ -1181,6 +1452,7 @@
     // 调试出口（也可在控制台手动调用）
     window.__memoryChain = {
         state: S, Store, recall, addChapter, buildFromWorldBook, parseAliasText, rebuildAutomaton,
+        gateScan, applyMilestone, milestones, hostBookName,
         get settings() { return S.settings; }, init,
     };
 

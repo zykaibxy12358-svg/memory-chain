@@ -79,6 +79,41 @@
     color: #e0793a;
 }
 
+/* 剧情闸门 */
+.memory-chain-settings .mc-gate-pending .mc-gate-title {
+    font-weight: 600;
+    font-size: 0.85em;
+    color: #d9a24a;
+    margin: 6px 0 2px;
+}
+
+.memory-chain-settings .mc-gate-item {
+    border: 1px dashed rgba(217, 162, 74, 0.6);
+    border-radius: 5px;
+    padding: 6px;
+    margin: 4px 0;
+    font-size: 0.82em;
+    line-height: 1.4;
+}
+
+.memory-chain-settings .mc-gate-item button {
+    margin: 4px 4px 0 0;
+}
+
+.memory-chain-settings .mc-gate-log {
+    white-space: pre-wrap;
+    font-size: 0.78em;
+    opacity: 0.85;
+    margin-top: 6px;
+}
+
+.memory-chain-settings #mc-gate-json {
+    width: 100%;
+    font-family: monospace;
+    font-size: 0.78em;
+    margin-bottom: 6px;
+}
+
 .memory-chain-settings #mc-paste-wrap textarea {
     width: 100%;
     margin-bottom: 6px;
