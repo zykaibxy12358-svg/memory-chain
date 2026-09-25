@@ -208,6 +208,7 @@
         const list = Array.isArray(entries) ? entries : Object.values(entries);
         const keyFreq = new Map();
         for (const en of list) {
+            if (en.disable) continue;                  // 解锁包（未解锁内容）不算词频
             const keys = Array.isArray(en.key) ? en.key : [];
             for (const k of keys) {
                 const kk = normalizeAlias(k);
@@ -215,8 +216,9 @@
                 keyFreq.set(kk, (keyFreq.get(kk) || 0) + 1);
             }
         }
-        let dropped = 0, stopped = 0, added = 0;
+        let dropped = 0, stopped = 0, added = 0, skipped = 0;
         for (const en of list) {
+            if (en.disable) { skipped++; continue; }   // 未解锁的内容不进词表
             const name = normalizeAlias(en.comment);
             if (!name) continue;
             const ent = ensureEntity(name);
@@ -237,8 +239,8 @@
         saveLexicon(source);
         syncStats();
         renderLexiconStatus();
-        log('词表构建完成：实体', S.entities.size, '别名', S.aliasMap.size, '丢弃通用词', dropped, '停用词/过短', stopped);
-        return { entities: S.entities.size, aliases: S.aliasMap.size, dropped: dropped, stopped: stopped };
+        log('词表构建完成：实体', S.entities.size, '别名', S.aliasMap.size, '丢弃通用词', dropped, '停用词/过短', stopped, '跳过未解锁', skipped);
+        return { entities: S.entities.size, aliases: S.aliasMap.size, dropped: dropped, stopped: stopped, skipped: skipped };
     }
 
     /** 手写别名：每行「别名 => 实体名」 */
