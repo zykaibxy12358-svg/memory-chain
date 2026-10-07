@@ -119,6 +119,33 @@
     margin-bottom: 6px;
 }
 
+/* 多线推进：线索台账 */
+.memory-chain-settings .mc-thread-list {
+    margin-top: 6px;
+}
+
+.memory-chain-settings .mc-thread-item {
+    border-left: 3px solid rgba(140, 180, 255, 0.55);
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: 4px;
+    padding: 4px 6px;
+    margin: 4px 0;
+    font-size: 0.8em;
+    line-height: 1.4;
+}
+
+.memory-chain-settings .mc-thread-item button {
+    margin: 3px 4px 0 0;
+    font-size: 0.9em;
+}
+
+.memory-chain-settings #mc-thread-json {
+    width: 100%;
+    font-family: monospace;
+    font-size: 0.78em;
+    margin-bottom: 6px;
+}
+
 /* 兜底浮动面板（找不到设置容器时才出现） */
 #mc-fab {
     position: fixed;
