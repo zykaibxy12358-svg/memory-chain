@@ -46,18 +46,6 @@
         gateBook: '',                // 留空=自动取当前聊天绑定的世界书
         gateStripPrefix: true,       // 解锁时去掉条目前的【未解锁】
         milestones: null,            // null = 用内置预设
-        // —— 多线推进（v2.0）——
-        pushEnabled: true,
-        pushIntensity: 1,            // 0=关 1=用户被动时 2=每 N 章必推 3=每轮都推
-        pushStaleChapters: 3,        // 停滞多少章算"该推了"
-        pushMain: 1,                 // 每轮主推几条
-        pushBg: 1,                   // 背景信号几条
-        pushCooldown: 3,             // 被推过的线索冷却章数
-        pushEvery: 4,                // 强度 2 时的间隔
-        pushDepth: 1,                // 注入深度（贴近最新消息）
-        pushShortChars: 12,          // 用户消息短于此视为被动
-        pushPassiveWords: '继续|接着|然后呢|随便|你来|你说|时间|跳过|快进|总结|嗯|哦',
-        threads: null,               // null = 从章节卡/世界书自动生成
     };
 
     // 内置里程碑预设（对话里出现"全部词 + 任一动词"即判定达成）
@@ -133,9 +121,6 @@
         milestonesSource: '',
         pending: [],                 // 待确认的里程碑
         unlocked: {},                // 已解锁里程碑 {id:{label,at,changed,book}}
-        threads: [],                 // 线索台账
-        lastBookForThreads: null,
-        pushState: { lastPushCh: null, pending: [] },
         maxHits: 1,
         turnsSinceChapter: 0,
         cache: { key: '', block: '' },
@@ -283,15 +268,6 @@
         rebuildAutomaton();
         // 实体表已重建 → 已有章节卡需要重新打标
         S.chapters.forEach((c) => { c.ents = []; indexCard(c); });
-        // 顺手刷新"线索台账"：章节卡的悬念 + 世界书里未解锁的未来
-        try {
-            S.lastBookForThreads = json;
-            S.chapters.forEach((c) => threadsFromChapter(c));
-            threadsFromBook(json);
-            syncGateThreads(json);
-            persistKV('threads', ensureThreads());
-            renderThreads();
-        } catch (e) { log('线索台账刷新失败', e); }
         saveLexicon(source);
         syncStats();
         renderLexiconStatus();
@@ -384,7 +360,6 @@
         S.cache = { key: '', block: '' };
         syncStats();
         persistCard(card);
-        try { threadsFromChapter(card); persistKV('threads', ensureThreads()); } catch (e) { log('线索登记失败', e); }
         return card;
     }
 
@@ -557,7 +532,7 @@
     }
 
     // 设置、手动别名、词表都属于"世界"，全局共享；只有章节卡按聊天隔离
-    const GLOBAL_KV = new Set(['settings', 'manualAliases', 'lexicon', 'gateUnlocked', 'threads']);
+    const GLOBAL_KV = new Set(['settings', 'manualAliases', 'lexicon', 'gateUnlocked']);
     function storageKey(key) {
         return GLOBAL_KV.has(key) ? 'global.' + key : slugify(S.ns) + '.' + key;
     }
@@ -1075,188 +1050,6 @@
         });
     }
 
-    // ---------------------------------------------------------------- 多线推进（v2.0）
-    // 目的：剧情有多条线时，用户不推就会卡住。这里维护一份"线索台账"，
-    //       检测停滞的线索，并在用户没有主动推进时注入"本轮请推进某条线"的指令。
-    // 线索来源（全部零额外模型调用）：
-    //   1) 章节卡的 open（悬念）字段——记忆链每成章就自带一条悬念
-    //   2) 世界书里默认禁用的【未解锁】条目——它们正是"还没发生的未来"
-    //   3) 手动登记（面板可编辑 JSON）
-
-    function currentChapterNo() {
-        return S.chapters.length ? S.chapters[S.chapters.length - 1].ch : 0;
-    }
-
-    function ensureThreads() {
-        if (!Array.isArray(S.threads)) S.threads = [];
-        return S.threads;
-    }
-
-    function addOrUpdateThread(spec) {
-        const list = ensureThreads();
-        const found = list.find((x) => x.key === spec.key);
-        if (found) {
-            found.lastCh = Math.max(found.lastCh || 0, spec.lastCh || 0);
-            if (spec.who && spec.who.length) found.who = spec.who;
-            if (spec.hint && !found.hint) found.hint = spec.hint;
-            return found;
-        }
-        const item = {
-            key: spec.key, title: spec.title || '(未命名线索)', source: spec.source || 'manual',
-            who: spec.who || [], lastCh: spec.lastCh || 0, hint: spec.hint || '',
-            heat: typeof spec.heat === 'number' ? spec.heat : 0.5,
-            pushed: 0, cooldownUntilCh: 0, done: false, createdCh: currentChapterNo(),
-        };
-        list.push(item);
-        return item;
-    }
-
-    function threadsFromChapter(card) {
-        if (!card || !card.open) return;
-        addOrUpdateThread({
-            key: 'open:' + card.ch, title: String(card.open).slice(0, 60), source: 'open',
-            who: card.who || [], lastCh: card.ch,
-        });
-    }
-
-    function threadsFromBook(book) {
-        if (!book || !book.entries) return 0;
-        const list = Array.isArray(book.entries) ? book.entries : Object.values(book.entries);
-        let n = 0;
-        for (const e of list) {
-            if (!e || !e.disable) continue;
-            const title = String(e.comment || '').replace(/^【未解锁】/, '').trim();
-            if (!title) continue;
-            addOrUpdateThread({
-                key: 'gate:' + title, title: title + '（尚未发生）', source: 'gate',
-                who: (e.key || []).slice(0, 4), lastCh: 0,
-                hint: '先以"听闻／提议／劝买／上书"的形式出现一次，不要直接跳到建成。', heat: 0.6,
-            });
-            n++;
-        }
-        return n;
-    }
-
-    /** 与闸门同步：世界书里被解锁的条目，对应线索自动标记完成 */
-    function syncGateThreads(book) {
-        if (!book || !book.entries) return;
-        const list = Array.isArray(book.entries) ? book.entries : Object.values(book.entries);
-        const pending = new Set();
-        for (const e of list) {
-            if (!e || !e.disable) continue;
-            const title = String(e.comment || '').replace(/^【未解锁】/, '').trim();
-            if (title) pending.add(title);
-        }
-        ensureThreads().forEach((t) => {
-            if (t.source !== 'gate') return;
-            const name = String(t.title).replace('（尚未发生）', '');
-            if (!pending.has(name)) t.done = true;    // 已解锁 → 这条"未来"不再是线索
-        });
-    }
-
-    /** 用户是不是"没在推任何一条线" */
-    function userIsPassive(text) {
-        const t = String(text || '').trim();
-        const words = String(S.settings.pushPassiveWords || '').split(/[|,，\s]+/).filter(Boolean);
-        if (!t) return true;
-        if (t.length <= Number(S.settings.pushShortChars || 12)) return true;
-        for (const w of words) if (w && t.indexOf(w) === 0) return true;
-        const hits = acScan(S.ac, t);
-        return hits.size === 0;
-    }
-
-    function threadCandidates() {
-        const chNow = currentChapterNo();
-        return ensureThreads()
-            .filter((t) => !t.done && chNow >= (t.cooldownUntilCh || 0))
-            .map((t) => {
-                const stale = t.lastCh ? (chNow - t.lastCh) : (chNow + 99);
-                return { t: t, stale: stale, score: stale * 0.6 + (t.heat || 0.5) * 0.4 - (t.pushed || 0) * 0.12 };
-            })
-            .sort((a, b) => b.score - a.score);
-    }
-
-    function shouldPushNow(userText) {
-        if (!S.settings.pushEnabled) return false;
-        const intensity = Number(S.settings.pushIntensity) || 0;
-        if (intensity <= 0) return false;
-        const chNow = currentChapterNo();
-        const since = chNow - (S.pushState.lastPushCh == null ? -999 : S.pushState.lastPushCh);
-        if (intensity === 3) return true;                        // 每轮都推
-        if (intensity === 2) return since >= (Number(S.settings.pushEvery) || 4);  // 每 N 章必推
-        return userIsPassive(userText) && since >= 1;            // 只在用户被动时推
-    }
-
-    function buildPushBlock(userText) {
-        const cands = threadCandidates();
-        if (!cands.length) return { block: '', picked: [] };
-        const staleMin = Number(S.settings.pushStaleChapters) || 3;
-        const mainN = clamp(Number(S.settings.pushMain) || 1, 0, 3);
-        const bgN = clamp(Number(S.settings.pushBg) || 1, 0, 3);
-        const hot = acScan(S.ac, String(userText || ''));
-        const hotNames = Array.from(hot.keys());
-        const eligible = cands.filter((c) => Number(S.settings.pushIntensity) === 3 ||
-            !(c.t.who || []).some((w) => hotNames.indexOf(w) >= 0));
-        const pool = eligible.length ? eligible : cands;
-        const stalePool = pool.filter((c) => c.stale >= staleMin);
-        const chosen = (stalePool.length ? stalePool : pool).slice(0, mainN + bgN);
-        if (!chosen.length) return { block: '', picked: [] };
-
-        const main = chosen.slice(0, mainN);
-        const bg = chosen.slice(mainN, mainN + bgN);
-        const lines = ['【多线推进·本轮任务】', '玩家这一轮没有主动推动任何线索。请在本轮回复里让故事自己往前走：'];
-        main.forEach((c, i) => {
-            lines.push((i + 1) + '. 主线推进：' + c.t.title +
-                '（已停滞 ' + (c.stale > 90 ? '从未推进' : c.stale + ' 章') +
-                ((c.t.who || []).length ? '｜关联：' + c.t.who.join('、') : '') + '）' +
-                (c.t.hint ? '　建议方式：' + c.t.hint : ''));
-        });
-        if (bg.length) lines.push('背景信号（各一句带过，不要展开）：' + bg.map((c) => c.t.title).join('；'));
-        lines.push('规矩：① 本轮只推进上述线索，不要顺手把别的线也解决；② 用场景、对话或消息自然带出，不要写成旁白交代；③ 不替玩家做决定，把选择权留在玩家手里；④ 推进后留下新的小钩子。');
-        return { block: lines.join('\n'), picked: chosen.map((c) => c.t) };
-    }
-
-    function injectPush(text) {
-        const fn = (ctx && typeof ctx.setExtensionPrompt === 'function') ? ctx.setExtensionPrompt
-            : (typeof setExtensionPrompt === 'function' ? setExtensionPrompt : null);
-        if (!fn) return;
-        fn('memoryChainThreads', text || '', positionValue(), clamp(Number(S.settings.pushDepth) || 1, 0, 100), false, extRoles.SYSTEM);
-    }
-
-    function planAndInjectPush(userText) {
-        if (!shouldPushNow(userText)) { injectPush(''); S.pushState.pending = []; return null; }
-        const r = buildPushBlock(userText);
-        injectPush(r.block);
-        S.pushState.pending = r.picked.map((t) => t.key);
-        S.pushState.lastPlanCh = currentChapterNo();
-        renderThreads();
-        return r;
-    }
-
-    /** 回复真正生成之后：记推进次数与冷却 */
-    function commitPush() {
-        const keys = S.pushState.pending || [];
-        if (!keys.length) return;
-        const chNow = currentChapterNo();
-        const cd = Number(S.settings.pushCooldown) || 3;
-        const list = ensureThreads();
-        keys.forEach((k, i) => {
-            const t = list.find((x) => x.key === k);
-            if (!t) return;
-            t.pushed = (t.pushed || 0) + 1;
-            t.lastCh = chNow;
-            t.cooldownUntilCh = chNow + (i === 0 ? 0 : cd);
-        });
-        S.pushState.lastPushCh = chNow;
-        S.pushState.pending = [];
-        persistKV('threads', list);
-        renderThreads();
-    }
-
-    function openThreadsCount() {
-        return ensureThreads().filter((t) => !t.done).length;
-    }
-
     // ---------------------------------------------------------------- UI
     let $panel = null;
 
@@ -1323,28 +1116,7 @@
       </div>
 
       <div class="mc-box">
-        <div class="mc-box-title">⑤ 多线推进（用户不推，剧情自己走）</div>
-        <label class="checkbox_label"><input id="mc-push-on" type="checkbox"><span>启用</span></label>
-        <div class="mc-row"><span>强度（0关/1用户被动时/2每N章/3每轮）</span><input id="mc-push-intensity" type="number" min="0" max="3"></div>
-        <div class="mc-row"><span>停滞多少章算"该推了"</span><input id="mc-push-stale" type="number" min="1" max="50"></div>
-        <div class="mc-row"><span>每轮主推 / 背景信号</span><input id="mc-push-main" type="number" min="0" max="3"><input id="mc-push-bg" type="number" min="0" max="3"></div>
-        <div class="mc-row"><span>冷却（章）/ 强度2间隔</span><input id="mc-push-cd" type="number" min="0" max="20"><input id="mc-push-every" type="number" min="1" max="50"></div>
-        <div id="mc-thread-status" class="mc-lex-status"></div>
-        <div id="mc-thread-list" class="mc-thread-list"></div>
-        <div class="mc-buttons">
-          <button id="mc-thread-refresh" class="menu_button">刷新线索</button>
-          <button id="mc-thread-plan" class="menu_button">现在推一条</button>
-          <button id="mc-thread-edit" class="menu_button">编辑线索 JSON</button>
-        </div>
-        <div id="mc-thread-json-wrap" style="display:none">
-          <textarea id="mc-thread-json" rows="5"></textarea>
-          <button id="mc-thread-save" class="menu_button">保存线索</button>
-        </div>
-        <div class="mc-hint">线索自动来自：章节卡的"悬念"字段、世界书里默认禁用的【未解锁】条目、（可手动补）。优先级＝停滞章数＋热度−已推次数。</div>
-      </div>
-
-      <div class="mc-box">
-        <div class="mc-box-title">⑥ 手动别名（可选）</div>
+        <div class="mc-box-title">④ 手动别名（可选）</div>
         <textarea id="mc-aliases" rows="4" placeholder="苓公子 => 茯苓&#10;宵塔主 => 茯宵"></textarea>
         <div class="mc-buttons">
           <button id="mc-save-aliases" class="menu_button">保存别名</button>
@@ -1436,190 +1208,7 @@
             toast('已清空已解锁记录（世界书里的条目不会被改回去）');
         });
 
-        // —— 多线推进 ——
-        bind('#mc-push-on', 'pushEnabled', 'bool');
-        bind('#mc-push-intensity', 'pushIntensity', 'num');
-        bind('#mc-push-stale', 'pushStaleChapters', 'num');
-        bind('#mc-push-main', 'pushMain', 'num');
-        bind('#mc-push-bg', 'pushBg', 'num');
-        bind('#mc-push-cd', 'pushCooldown', 'num');
-        bind('#mc-push-every', 'pushEvery', 'num');
-        $panel.find('#mc-thread-refresh').on('click', () => {
-            ensureThreadsFromState();
-            persistKV('threads', ensureThreads());
-            renderThreads();
-            toast('线索台账已刷新：共 ' + ensureThreads().length + ' 条，未完成 ' + openThreadsCount() + ' 条');
-        });
-        $panel.find('#mc-thread-plan').on('click', () => {
-            const r = buildPushBlock('');
-            if (!r.block) { toast('没有可推进的线索（先「刷新线索」或攒几章）', true); return; }
-            const ch = prompt('本轮要推的线索（可改，留空=取消）：', r.block);
-            if (ch == null) return;
-            injectPush(ch);
-            S.pushState.pending = r.picked.map((t) => t.key);
-            S.pushState.lastPlanCh = currentChapterNo();
-            toast('已注入本轮推进指令：' + r.picked.map((t) => t.title).join('；'));
-        });
-        $panel.find('#mc-thread-edit').on('click', () => {
-            const wrap = $panel.find('#mc-thread-json-wrap');
-            if (wrap.is(':hidden')) $panel.find('#mc-thread-json').val(JSON.stringify(ensureThreads(), null, 1));
-            wrap.toggle();
-        });
-        $panel.find('#mc-thread-save').on('click', () => {
-            try {
-                const arr = JSON.parse(String($panel.find('#mc-thread-json').val() || '[]'));
-                if (!Array.isArray(arr)) throw new Error('必须是数组');
-                S.threads = arr;
-                S.settings.threads = arr;
-                saveSettings();
-                persistKV('threads', S.threads);
-                renderThreads();
-                toast('线索已保存（' + arr.length + ' 条）');
-            } catch (e) { toast('JSON 解析失败：' + e.message, true); }
-        });
-
-        $panel.find('#mc-aliases').val(S.manualAliases.map((m) => m.alias + ' => ' + m.name).join('\n'));
-        $panel.find('#mc-save-aliases').on('click', () => {
-            S.manualAliases = parseAliasText($panel.find('#mc-aliases').val());
-            persistKV('manualAliases', S.manualAliases);
-            rebuildAutomaton();
-            renderStats();
-            toast('别名已保存');
-        });
-
-        $panel.find('#mc-file').on('change', function () {
-            const f = this.files && this.files[0];
-            if (!f) return;
-            const rd = new FileReader();
-            rd.onload = () => {
-                try {
-                    const r = buildFromWorldBook(JSON.parse(String(rd.result)), '文件：' + f.name);
-                    renderStats();
-                    toast(`词表已建立：实体 ${r.entities} / 别名 ${r.aliases}（过滤 ${r.dropped + r.stopped}）`);
-                } catch (e) { toast('导入失败：' + e.message, true); }
-            };
-            rd.readAsText(f, 'utf-8');
-        });
-        $panel.find('#mc-pick-file').on('click', () => $panel.find('#mc-file').trigger('click'));
-        $panel.find('#mc-paste-toggle').on('click', () => $panel.find('#mc-paste-wrap').toggle());
-        $panel.find('#mc-parse-paste').on('click', () => {
-            const txt = String($panel.find('#mc-paste').val() || '').trim();
-            if (!txt) { toast('先粘贴世界书 JSON 内容', true); return; }
-            try {
-                const r = buildFromWorldBook(JSON.parse(txt), '粘贴导入');
-                renderStats();
-                toast(`词表已建立：实体 ${r.entities} / 别名 ${r.aliases}（过滤 ${r.dropped + r.stopped}）`);
-            } catch (e) { toast('解析失败：' + e.message, true); }
-        });
-        $panel.find('#mc-pull-wi').on('click', async () => {
-            toast('正在从宿主读取世界书…');
-            const json = await fetchBoundWorldInfo();
-            if (!json) { toast('没读到已绑定的世界书，请改用「选择世界书 JSON 文件…」', true); return; }
-            try {
-                const r = buildFromWorldBook(json, '宿主世界书');
-                renderStats();
-                toast(`词表已建立：实体 ${r.entities} / 别名 ${r.aliases}`);
-            } catch (e) { toast('建表失败：' + e.message, true); }
-        });
-
-        $panel.find('#mc-chapter').on('click', () => {
-            summarizeNow(nextFrom(), false).then((c) => {
-                if (c) toast('已记录第 ' + c.ch + ' 章');
-                renderStats();
-            });
-        });
-
-        $panel.find('#mc-export').on('click', () => {
-            const data = { v: 1, ns: S.ns, chapters: S.chapters, manualAliases: S.manualAliases, settings: S.settings };
-            const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
-            const a = document.createElement('a');
-            a.href = URL.createObjectURL(blob);
-            a.download = 'memory-chain-' + Date.now() + '.json';
-            a.click();
-            URL.revokeObjectURL(a.href);
-        });
-
-        $panel.find('#mc-import').on('click', () => $panel.find('#mc-import-file').trigger('click'));
-        $panel.find('#mc-import-file').on('change', function () {
-            const f = this.files && this.files[0];
-            if (!f) return;
-            const rd = new FileReader();
-            rd.onload = () => {
-                try {
-                    const d = JSON.parse(String(rd.result));
-                    const arr = Array.isArray(d.chapters) ? d.chapters : [];
-                    let n = 0;
-                    for (const raw of arr) {
-                        if (!raw) continue;
-                        const card = makeCard(Object.assign({}, raw, { ch: S.chapters.length + 1 }));
-                        S.chapters.push(card); S.cardByCh.set(card.ch, card); indexCard(card); persistCard(card); n++;
-                    }
-                    if (Array.isArray(d.manualAliases) && d.manualAliases.length) {
-                        S.manualAliases = d.manualAliases;
-                        persistKV('manualAliases', S.manualAliases);
-                        rebuildAutomaton();
-                    }
-                    syncStats(); renderStats();
-                    toast('导入 ' + n + ' 章');
-                } catch (e) { toast('导入失败：' + e.message, true); }
-            };
-            rd.readAsText(f, 'utf-8');
-        });
-
-        $panel.find('#mc-clear').on('click', () => {
-            S.chapters = []; S.cardByCh.clear();
-            S.entities.forEach((e) => { e.cards = []; e.lastCh = 0; e.hits = 0; });
-            S.cache = { key: '', block: '' };
-            Store.clearCards();
-            syncStats(); renderStats();
-            toast('本章记忆已清空');
-        });
         renderStats();
-    }
-
-    function renderThreads() {
-        if (!$panel || !$panel.length) return;
-        const list = ensureThreads();
-        const chNow = currentChapterNo();
-        const status = $panel.find('#mc-thread-status');
-        if (status.length) {
-            const open = list.filter((t) => !t.done);
-            const staleN = open.filter((t) => (t.lastCh ? chNow - t.lastCh : 999) >= (Number(S.settings.pushStaleChapters) || 3)).length;
-            status.text('线索 ' + list.length + ' 条（未完成 ' + open.length + '，其中停滞 ' + staleN + '）'
-                + '　强度 ' + (S.settings.pushIntensity || 0)
-                + (S.pushState.lastPushCh != null ? '　上次推进于第 ' + S.pushState.lastPushCh + ' 章' : '　尚未推进过'));
-        }
-        const box = $panel.find('#mc-thread-list');
-        if (!box.length) return;
-        box.empty();
-        const sorted = list.slice().sort((a, b) => {
-            const sa = a.lastCh ? chNow - a.lastCh : 999, sb = b.lastCh ? chNow - b.lastCh : 999;
-            return (b.done ? -1 : 1) - (a.done ? -1 : 1) || sb - sa;
-        }).slice(0, 12);
-        sorted.forEach((t) => {
-            const stale = t.lastCh ? (chNow - t.lastCh) : '从未';
-            const row = $('<div class="mc-thread-item"></div>');
-            row.append($('<div></div>').text((t.done ? '✔ ' : '· ') + t.title +
-                '　[' + t.source + '｜停滞 ' + stale + (typeof stale === 'number' ? ' 章' : '') + '｜已推 ' + (t.pushed || 0) + ']'));
-            const b1 = $('<button class="menu_button">推一下</button>').on('click', () => {
-                const blk = buildPushBlock('');
-                const r = injectPush;
-                const lines = ['【多线推进·手动指定】', '请在本轮回复里推进这条线索：' + t.title + (t.hint ? '（建议：' + t.hint + '）' : ''),
-                    '规矩：自然带出、不要一次解决、不替玩家做决定。'];
-                injectPush(lines.join('\n'));
-                S.pushState.pending = [t.key];
-                renderThreads();
-                toast('已注入：' + t.title);
-            });
-            const b2 = $('<button class="menu_button">完成</button>').on('click', () => {
-                t.done = true; persistKV('threads', list); renderThreads();
-            });
-            const b3 = $('<button class="menu_button">删除</button>').on('click', () => {
-                S.threads = list.filter((x) => x.key !== t.key); persistKV('threads', S.threads); renderThreads();
-            });
-            row.append(b1).append(b2).append(b3);
-            box.append(row);
-        });
     }
 
     function renderGate() {
@@ -1701,8 +1290,7 @@
                 const chat = ctx.chat || [];
                 const lastUser = [...chat].reverse().find((m) => m && m.is_user);
                 const userText = lastUser ? lastUser.mes : '';
-                onGenerate(userText);
-                try { planAndInjectPush(userText); } catch (e) { warn('多线推进注入失败', e); }
+
             });
         }
         if (event_types.MESSAGE_SENT) eventSource.on(event_types.MESSAGE_SENT, onSent);
@@ -1710,7 +1298,6 @@
 
         if (event_types.GENERATION_ENDED) {
             eventSource.on(event_types.GENERATION_ENDED, () => {
-                try { commitPush(); } catch (e) { warn('推进记录失败', e); }
                 maybeAutoChapter(false);
                 try { gateScan(false); } catch (e) { warn('闸门扫描失败', e); }
             });
@@ -1733,7 +1320,14 @@
     }
 
     // ---------------------------------------------------------------- 初始化
-    async function init() {
+    // 幂等：宿主可能多次触发 bootstrap，这里只初始化一次，后来者 await 同一个 Promise
+    let initPromise = null;
+    function init() {
+        if (!initPromise) initPromise = doInit();
+        return initPromise;
+    }
+
+    async function doInit() {
         if (!bindContext()) await waitForContext(10000);
         try {
             if (ctx.extensionSettings && ctx.extensionSettings[MODULE]) {
@@ -1746,9 +1340,6 @@
         await loadAll();
         const gu = await Store.loadKV('gateUnlocked');
         if (gu && typeof gu === 'object') S.unlocked = gu;
-        const th = await Store.loadKV('threads');
-        if (Array.isArray(th) && th.length) S.threads = th;
-        else if (Array.isArray(S.settings.threads) && S.settings.threads.length) S.threads = S.settings.threads;
         if (S.lexicon) restoreLexicon(S.lexicon);
         S.manualAliases.forEach((m) => addAlias(m.alias, m.name, true));
         rebuildAutomaton();
@@ -1775,9 +1366,6 @@
     window.__memoryChain = {
         state: S, Store, recall, addChapter, buildFromWorldBook, parseAliasText, rebuildAutomaton,
         gateScan, applyMilestone, milestones, hostBookName,
-        // 多线推进
-        ensureThreads, threadsFromChapter, threadsFromBook, userIsPassive, threadCandidates,
-        shouldPushNow, buildPushBlock, planAndInjectPush, commitPush, openThreadsCount, renderThreads,
         get settings() { return S.settings; }, init,
     };
 
